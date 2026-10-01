@@ -49,7 +49,7 @@ final class History {
 
     @ObservationIgnored private var changeCount = NSPasteboard.general.changeCount
     @ObservationIgnored private var pending = NSPasteboard.general.changeCount
-    @ObservationIgnored private var copying = false
+    @ObservationIgnored private var busy = false
 
     private let database: OpaquePointer?
     private let insert: OpaquePointer?
@@ -114,7 +114,7 @@ final class History {
 
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, !self.copying else { return }
+                guard let self, !self.busy else { return }
 
                 let pasteboard = NSPasteboard.general
                 let count = pasteboard.changeCount
@@ -160,17 +160,20 @@ final class History {
                 var hashes = [Substring]().makeIterator()
 
                 if !jobs.isEmpty {
-                    let pipe = Pipe()
+                    let output = History.data.appending(path: "hashes")
+                    FileManager.default.createFile(atPath: output.path, contents: nil)
+
                     let process = Process()
                     process.executableURL = Bundle.main.executableURL
                     process.arguments = jobs
-                    process.standardOutput = pipe
+                    process.standardOutput = try! FileHandle(forWritingTo: output)
                     try! process.run()
 
-                    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    self.busy = true
                     process.waitUntilExit()
+                    self.busy = false
 
-                    hashes = output.split(separator: "\n").makeIterator()
+                    hashes = try! String(contentsOf: output, encoding: .utf8).split(separator: "\n").makeIterator()
                 }
 
                 sqlite3_exec(self.database, "BEGIN", nil, nil, nil)
@@ -224,9 +227,9 @@ final class History {
 
             pasteboard.writeObjects([(clone ?? URL(filePath: content)) as NSURL])
         case .image:
-            copying = true
+            busy = true
             try! Process.run(Bundle.main.executableURL!, arguments: ["copy", item.folder.appending(path: "image").path, content]).waitUntilExit()
-            copying = false
+            busy = false
         }
 
         changeCount = pasteboard.changeCount
@@ -459,9 +462,16 @@ enum Main {
                 hasher.update(data: data!)
             } else if (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
                 let handle = try! FileHandle(forReadingFrom: source)
+                _ = fcntl(handle.fileDescriptor, F_NOCACHE, 1)
 
-                while let chunk = try! handle.read(upToCount: 1 << 20), !chunk.isEmpty {
-                    hasher.update(data: chunk)
+                var done = false
+
+                while !done {
+                    autoreleasepool {
+                        let chunk = try! handle.read(upToCount: 1 << 20) ?? Data()
+                        done = chunk.isEmpty
+                        hasher.update(data: chunk)
+                    }
                 }
             } else {
                 hasher.update(data: Data(source.path.utf8))
