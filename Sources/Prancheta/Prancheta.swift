@@ -32,13 +32,15 @@ final class History {
     static let directory = URL.applicationSupportDirectory.appending(path: "Prancheta")
     static let data = directory.appending(path: "data")
 
-    private static let schema: Int32 = 3
+    private static let schema: Int32 = 4
 
     var items: [Item] = []
 
     var query = "" { didSet { reload() } }
 
     @ObservationIgnored private var changeCount = NSPasteboard.general.changeCount
+    @ObservationIgnored private var pending = NSPasteboard.general.changeCount
+    @ObservationIgnored private var copying = false
 
     private let database: OpaquePointer?
     private let insert: OpaquePointer?
@@ -91,7 +93,7 @@ final class History {
         remove = prepare("DELETE FROM items WHERE kind = ? AND content = ? RETURNING storage")
         trim = prepare("DELETE FROM items WHERE id <= (SELECT id FROM items ORDER BY id DESC LIMIT 1 OFFSET 1000) RETURNING storage")
         touch = prepare("UPDATE items SET id = (SELECT max(id) FROM items) + 1 WHERE id = ?")
-        recent = prepare("SELECT id, kind, substr(content, 1, 200), size, storage, '' FROM items ORDER BY id DESC LIMIT 100")
+        recent = prepare("SELECT id, kind, iif(kind = 1, content, substr(content, 1, 200)), size, storage, '' FROM items ORDER BY id DESC LIMIT 100")
         fetch = prepare("SELECT content FROM items WHERE id = ?")
 
         self.database = database
@@ -100,45 +102,56 @@ final class History {
 
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, !self.copying else { return }
 
                 let pasteboard = NSPasteboard.general
-                guard pasteboard.changeCount != self.changeCount, pasteboard.types?.isEmpty == false else { return }
+                let count = pasteboard.changeCount
+                guard count != self.changeCount else { return }
+                guard count == self.pending else { self.pending = count; return }
 
-                self.changeCount = pasteboard.changeCount
+                self.changeCount = count
 
                 guard pasteboard.availableType(from: [.concealed, .transient]) == nil else { return }
 
-                autoreleasepool {
-                    if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+                var jobs: [String] = []
+                var entries: [(kind: Item.Kind, content: String, storage: String)] = []
+
+                if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+                    for url in urls.reversed() {
                         let storage = UUID().uuidString
                         let folder = History.data.appending(path: storage)
                         try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
-                        if let source = CGImageSourceCreateWithURL(urls[0] as CFURL, nil) {
-                            History.writeThumbnail(source, to: folder)
-                        }
-
-                        let size = urls.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
-                        self.add(.file, urls.map(\.path).joined(separator: "\n"), size: size, storage: storage)
+                        jobs += ["file", url.path, folder.path]
+                        entries.append((.file, url.path, storage))
 
                         DispatchQueue.global(qos: .utility).async {
-                            for url in urls {
-                                clonefile(url.path, folder.appending(path: url.lastPathComponent).path, 0)
-                            }
+                            clonefile(url.path, folder.appending(path: url.lastPathComponent).path, 0)
                         }
-                    } else if let text = pasteboard.string(forType: .string), !text.isEmpty {
-                        self.add(.text, text, size: Int64(text.utf8.count), storage: "")
-                    } else if let type = pasteboard.availableType(from: [.png, .tiff]), let image = pasteboard.data(forType: type) {
-                        let storage = UUID().uuidString
-                        let folder = History.data.appending(path: storage)
-                        try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                        try! image.write(to: folder.appending(path: "image"))
-
-                        History.writeThumbnail(CGImageSourceCreateWithData(image as CFData, nil)!, to: folder)
-
-                        self.add(.image, type.rawValue, size: Int64(image.count), storage: storage)
                     }
+                } else if let text = pasteboard.string(forType: .string), !text.isEmpty {
+                    self.add(.text, text, size: Int64(text.utf8.count), storage: "")
+                } else {
+                    for (index, item) in pasteboard.pasteboardItems!.enumerated().reversed() {
+                        guard let type = item.availableType(from: [.png, .tiff]) else { continue }
+
+                        let storage = UUID().uuidString
+                        try! FileManager.default.createDirectory(at: History.data.appending(path: storage), withIntermediateDirectories: true)
+
+                        jobs += ["image", String(index), History.data.appending(path: storage).path]
+                        entries.append((.image, type.rawValue, storage))
+                    }
+                }
+
+                if !jobs.isEmpty {
+                    try! Process.run(Bundle.main.executableURL!, arguments: jobs).waitUntilExit()
+                }
+
+                for entry in entries {
+                    let file = entry.kind == .image ? History.data.appending(path: entry.storage).appending(path: "image") : URL(filePath: entry.content)
+                    let size = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+
+                    self.add(entry.kind, entry.content, size: size, storage: entry.storage)
                 }
 
                 self.reload()
@@ -160,14 +173,14 @@ final class History {
         case .text:
             pasteboard.setString(content, forType: .string)
         case .file:
-            pasteboard.writeObjects(content.split(separator: "\n").map {
-                let original = URL(filePath: String($0))
-                let clone = folder.appending(path: original.lastPathComponent)
+            let original = URL(filePath: content)
+            let clone = folder.appending(path: original.lastPathComponent)
 
-                return (FileManager.default.fileExists(atPath: clone.path) ? clone : original) as NSURL
-            })
+            pasteboard.writeObjects([(FileManager.default.fileExists(atPath: clone.path) ? clone : original) as NSURL])
         case .image:
-            pasteboard.setData(try! Data(contentsOf: folder.appending(path: "image")), forType: .init(content))
+            copying = true
+            try! Process.run(Bundle.main.executableURL!, arguments: ["copy", folder.appending(path: "image").path, content]).waitUntilExit()
+            copying = false
         }
 
         changeCount = pasteboard.changeCount
@@ -238,7 +251,7 @@ final class History {
         var statement = recent
 
         if !terms.isEmpty {
-            var sql = "SELECT items.id, items.kind, substr(items.content, 1, 200), items.size, items.storage, "
+            var sql = "SELECT items.id, items.kind, iif(items.kind = 1, items.content, substr(items.content, 1, 200)), items.size, items.storage, "
             sql += long.isEmpty ? "'' FROM items WHERE items.kind != 2" : "snippet(items_fts, 0, '', '', '…', 64) FROM items JOIN items_fts ON items_fts.rowid = items.id WHERE items.kind != 2 AND items_fts MATCH ?"
             sql += String(repeating: " AND items.content LIKE ? ESCAPE '\\'", count: short.count)
             sql += " ORDER BY items.id DESC LIMIT 100"
@@ -270,7 +283,7 @@ final class History {
 
             let title = switch kind {
             case .text: (snippet.isEmpty ? content : snippet).replacing(/\s/, with: " ")
-            case .file: content.split(separator: "\n").map { URL(filePath: String($0)).lastPathComponent }.joined(separator: ", ")
+            case .file: URL(filePath: content).lastPathComponent
             case .image: ""
             }
 
@@ -295,20 +308,6 @@ final class History {
         }
 
         self.items = items
-    }
-
-    private static func writeThumbnail(_ source: CGImageSource, to folder: URL) {
-        let options = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 240,
-        ] as CFDictionary
-
-        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return }
-
-        let destination = CGImageDestinationCreateWithURL(folder.appending(path: "thumbnail.png") as CFURL, "public.png" as CFString, 1, nil)!
-        CGImageDestinationAddImage(destination, thumbnail, nil)
-        CGImageDestinationFinalize(destination)
     }
 
     private static func resetData() {
@@ -420,6 +419,44 @@ struct ContentView: View {
 }
 
 @main
+enum Main {
+    static func main() {
+        guard CommandLine.arguments.count > 1 else { return PranchetaApp.main() }
+
+        let arguments = CommandLine.arguments
+        let pasteboard = NSPasteboard.general
+
+        for job in stride(from: 1, to: arguments.count, by: 3) {
+            var source = URL(filePath: arguments[job + 1])
+            let target = URL(filePath: arguments[job + 2])
+
+            if arguments[job] == "copy" {
+                pasteboard.clearContents()
+                pasteboard.setData(try! Data(contentsOf: source, options: .alwaysMapped), forType: .init(arguments[job + 2]))
+                continue
+            }
+
+            if arguments[job] == "image" {
+                let item = pasteboard.pasteboardItems![Int(arguments[job + 1])!]
+                source = target.appending(path: "image")
+                try! item.data(forType: item.availableType(from: [.png, .tiff])!)!.write(to: source)
+            }
+
+            let options = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 240,
+            ] as CFDictionary
+
+            guard let image = CGImageSourceCreateWithURL(source as CFURL, nil), let thumbnail = CGImageSourceCreateThumbnailAtIndex(image, 0, options) else { continue }
+
+            let destination = CGImageDestinationCreateWithURL(target.appending(path: "thumbnail.png") as CFURL, "public.png" as CFString, 1, nil)!
+            CGImageDestinationAddImage(destination, thumbnail, nil)
+            CGImageDestinationFinalize(destination)
+        }
+    }
+}
+
 struct PranchetaApp: App {
     @State private var history = History()
 
