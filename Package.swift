@@ -1,9 +1,9 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.4
 import PackageDescription
 
 let package = Package(
     name: "Prancheta",
-    platforms: [.macOS("27.0")],
+    platforms: [.macOS(.v27)],
     targets: [
         .executableTarget(name: "Prancheta", linkerSettings: [.linkedLibrary("sqlite3")])
     ]
