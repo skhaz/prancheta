@@ -12,7 +12,7 @@ jobs:
   release:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - run: ./build.sh
 
@@ -21,3 +21,15 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" Prancheta.zip --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - run: |
+          echo "$TAP_DEPLOY_KEY" > "$RUNNER_TEMP/key"
+          chmod 600 "$RUNNER_TEMP/key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/key -o StrictHostKeyChecking=accept-new"
+          git clone git@github.com:skhaz/homebrew-tap.git "$RUNNER_TEMP/tap"
+          cd "$RUNNER_TEMP/tap"
+          sed -i '' -e "s/version \".*\"/version \"${GITHUB_REF_NAME#v}\"/" -e "s/sha256 \".*\"/sha256 \"$(shasum -a 256 "$GITHUB_WORKSPACE/Prancheta.zip" | cut -d ' ' -f 1)\"/" Casks/prancheta.rb
+          git -c user.name="Rodrigo Delduca" -c user.email="rodrigo@delduca.org" commit -am "Update prancheta to ${GITHUB_REF_NAME#v}"
+          git push
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
