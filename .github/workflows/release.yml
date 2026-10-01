@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: ./build.sh
+
+      - run: ditto -c -k --norsrc --noextattr --noacl --keepParent Prancheta.app Prancheta.zip
+
+      - run: gh release create "$GITHUB_REF_NAME" Prancheta.zip --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

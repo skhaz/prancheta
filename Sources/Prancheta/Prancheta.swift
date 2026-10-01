@@ -1,0 +1,436 @@
+import AppKit
+import ImageIO
+import ServiceManagement
+import SQLite3
+import SwiftUI
+
+extension NSPasteboard.PasteboardType {
+    static let concealed = Self("org.nspasteboard.ConcealedType")
+    static let transient = Self("org.nspasteboard.TransientType")
+}
+
+struct Item: Identifiable {
+    enum Kind: Int32 {
+        case text, file, image
+    }
+
+    let id: Int64
+    let kind: Kind
+    let title: String
+    let size: Int64
+    let storage: String
+    let preview: URL?
+
+    var detail: String {
+        kind == .text ? "" : size.formatted(.byteCount(style: .file))
+    }
+}
+
+@MainActor
+@Observable
+final class History {
+    static let directory = URL.applicationSupportDirectory.appending(path: "Prancheta")
+    static let data = directory.appending(path: "data")
+
+    private static let schema: Int32 = 3
+
+    var items: [Item] = []
+
+    var query = "" { didSet { reload() } }
+
+    @ObservationIgnored private var changeCount = NSPasteboard.general.changeCount
+
+    private let database: OpaquePointer?
+    private let insert: OpaquePointer?
+    private let remove: OpaquePointer?
+    private let trim: OpaquePointer?
+    private let touch: OpaquePointer?
+    private let recent: OpaquePointer?
+    private let fetch: OpaquePointer?
+
+    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    init() {
+        try! FileManager.default.createDirectory(at: History.data, withIntermediateDirectories: true)
+
+        var database: OpaquePointer?
+        sqlite3_open(History.directory.appending(path: "history.sqlite").path, &database)
+
+        func prepare(_ sql: String) -> OpaquePointer? {
+            var statement: OpaquePointer?
+            sqlite3_prepare_v3(database, sql, -1, UInt32(SQLITE_PREPARE_PERSISTENT), &statement, nil)
+            return statement
+        }
+
+        let version = prepare("PRAGMA user_version")
+        sqlite3_step(version)
+        let current = sqlite3_column_int(version, 0)
+        sqlite3_finalize(version)
+
+        if current != History.schema {
+            sqlite3_exec(database, "DROP TABLE IF EXISTS items_fts; DROP TABLE IF EXISTS items; VACUUM; PRAGMA user_version = \(History.schema)", nil, nil, nil)
+            History.resetData()
+        }
+
+        sqlite3_exec(database, """
+            CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, kind INTEGER NOT NULL, content TEXT NOT NULL, size INTEGER NOT NULL, storage TEXT NOT NULL);
+            CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(content, content='items', content_rowid='id', tokenize='trigram remove_diacritics 1');
+            CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items WHEN new.kind != 2 BEGIN
+              INSERT INTO items_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items WHEN old.kind != 2 BEGIN
+              INSERT INTO items_fts(items_fts, rowid, content) VALUES ('delete', old.id, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF id ON items WHEN new.kind != 2 BEGIN
+              INSERT INTO items_fts(items_fts, rowid, content) VALUES ('delete', old.id, old.content);
+              INSERT INTO items_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            """, nil, nil, nil)
+
+        insert = prepare("INSERT INTO items(kind, content, size, storage) VALUES (?, ?, ?, ?)")
+        remove = prepare("DELETE FROM items WHERE kind = ? AND content = ? RETURNING storage")
+        trim = prepare("DELETE FROM items WHERE id <= (SELECT id FROM items ORDER BY id DESC LIMIT 1 OFFSET 1000) RETURNING storage")
+        touch = prepare("UPDATE items SET id = (SELECT max(id) FROM items) + 1 WHERE id = ?")
+        recent = prepare("SELECT id, kind, substr(content, 1, 200), size, storage, '' FROM items ORDER BY id DESC LIMIT 100")
+        fetch = prepare("SELECT content FROM items WHERE id = ?")
+
+        self.database = database
+
+        reload()
+
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+
+                let pasteboard = NSPasteboard.general
+                guard pasteboard.changeCount != self.changeCount, pasteboard.types?.isEmpty == false else { return }
+
+                self.changeCount = pasteboard.changeCount
+
+                guard pasteboard.availableType(from: [.concealed, .transient]) == nil else { return }
+
+                autoreleasepool {
+                    if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+                        let storage = UUID().uuidString
+                        let folder = History.data.appending(path: storage)
+                        try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+                        if let source = CGImageSourceCreateWithURL(urls[0] as CFURL, nil) {
+                            History.writeThumbnail(source, to: folder)
+                        }
+
+                        let size = urls.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+                        self.add(.file, urls.map(\.path).joined(separator: "\n"), size: size, storage: storage)
+
+                        DispatchQueue.global(qos: .utility).async {
+                            for url in urls {
+                                clonefile(url.path, folder.appending(path: url.lastPathComponent).path, 0)
+                            }
+                        }
+                    } else if let text = pasteboard.string(forType: .string), !text.isEmpty {
+                        self.add(.text, text, size: Int64(text.utf8.count), storage: "")
+                    } else if let type = pasteboard.availableType(from: [.png, .tiff]), let image = pasteboard.data(forType: type) {
+                        let storage = UUID().uuidString
+                        let folder = History.data.appending(path: storage)
+                        try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                        try! image.write(to: folder.appending(path: "image"))
+
+                        History.writeThumbnail(CGImageSourceCreateWithData(image as CFData, nil)!, to: folder)
+
+                        self.add(.image, type.rawValue, size: Int64(image.count), storage: storage)
+                    }
+                }
+
+                self.reload()
+            }
+        }
+    }
+
+    func copy(_ item: Item) {
+        sqlite3_bind_int64(fetch, 1, item.id)
+        sqlite3_step(fetch)
+        let content = String(cString: sqlite3_column_text(fetch, 0))
+        sqlite3_reset(fetch)
+
+        let folder = History.data.appending(path: item.storage)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+
+        switch item.kind {
+        case .text:
+            pasteboard.setString(content, forType: .string)
+        case .file:
+            pasteboard.writeObjects(content.split(separator: "\n").map {
+                let original = URL(filePath: String($0))
+                let clone = folder.appending(path: original.lastPathComponent)
+
+                return (FileManager.default.fileExists(atPath: clone.path) ? clone : original) as NSURL
+            })
+        case .image:
+            pasteboard.setData(try! Data(contentsOf: folder.appending(path: "image")), forType: .init(content))
+        }
+
+        changeCount = pasteboard.changeCount
+
+        sqlite3_bind_int64(touch, 1, item.id)
+        sqlite3_step(touch)
+        sqlite3_reset(touch)
+
+        reload()
+
+        NSApp.keyWindow?.close()
+    }
+
+    func clear() {
+        let alert = NSAlert()
+        alert.messageText = "Clear the history?"
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+
+        NSApp.activate()
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        sqlite3_exec(database, "DELETE FROM items; VACUUM", nil, nil, nil)
+        History.resetData()
+
+        reload()
+    }
+
+    private func add(_ kind: Item.Kind, _ content: String, size: Int64, storage: String) {
+        sqlite3_exec(database, "BEGIN", nil, nil, nil)
+
+        if kind != .image {
+            sqlite3_bind_int(remove, 1, kind.rawValue)
+            sqlite3_bind_text(remove, 2, content, -1, transient)
+            deleteStorage(remove)
+        }
+
+        sqlite3_bind_int(insert, 1, kind.rawValue)
+        sqlite3_bind_text(insert, 2, content, -1, transient)
+        sqlite3_bind_int64(insert, 3, size)
+        sqlite3_bind_text(insert, 4, storage, -1, transient)
+        sqlite3_step(insert)
+        sqlite3_reset(insert)
+
+        deleteStorage(trim)
+
+        sqlite3_exec(database, "COMMIT", nil, nil, nil)
+    }
+
+    private func deleteStorage(_ statement: OpaquePointer?) {
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let storage = String(cString: sqlite3_column_text(statement, 0))
+
+            if !storage.isEmpty {
+                try? FileManager.default.removeItem(at: History.data.appending(path: storage))
+            }
+        }
+
+        sqlite3_reset(statement)
+    }
+
+    private func reload() {
+        let terms = query.split(separator: " ")
+        let long = terms.filter { $0.count >= 3 }
+        let short = terms.filter { $0.count < 3 }
+
+        var statement = recent
+
+        if !terms.isEmpty {
+            var sql = "SELECT items.id, items.kind, substr(items.content, 1, 200), items.size, items.storage, "
+            sql += long.isEmpty ? "'' FROM items WHERE items.kind != 2" : "snippet(items_fts, 0, '', '', '…', 64) FROM items JOIN items_fts ON items_fts.rowid = items.id WHERE items.kind != 2 AND items_fts MATCH ?"
+            sql += String(repeating: " AND items.content LIKE ? ESCAPE '\\'", count: short.count)
+            sql += " ORDER BY items.id DESC LIMIT 100"
+
+            sqlite3_prepare_v2(database, sql, -1, &statement, nil)
+
+            var index: Int32 = 1
+
+            if !long.isEmpty {
+                let match = long.map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"" }.joined(separator: " ")
+                sqlite3_bind_text(statement, index, match, -1, transient)
+                index += 1
+            }
+
+            for term in short {
+                let pattern = term.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
+                sqlite3_bind_text(statement, index, "%\(pattern)%", -1, transient)
+                index += 1
+            }
+        }
+
+        var items: [Item] = []
+        items.reserveCapacity(100)
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let kind = Item.Kind(rawValue: sqlite3_column_int(statement, 1))!
+            let content = String(cString: sqlite3_column_text(statement, 2))
+            let snippet = String(cString: sqlite3_column_text(statement, 5))
+
+            let title = switch kind {
+            case .text: (snippet.isEmpty ? content : snippet).replacing(/\s/, with: " ")
+            case .file: content.split(separator: "\n").map { URL(filePath: String($0)).lastPathComponent }.joined(separator: ", ")
+            case .image: ""
+            }
+
+            let storage = String(cString: sqlite3_column_text(statement, 4))
+            let thumbnail = History.data.appending(path: storage).appending(path: "thumbnail.png")
+            let preview = kind == .image || (kind == .file && FileManager.default.fileExists(atPath: thumbnail.path)) ? thumbnail : nil
+
+            items.append(Item(
+                id: sqlite3_column_int64(statement, 0),
+                kind: kind,
+                title: title,
+                size: sqlite3_column_int64(statement, 3),
+                storage: storage,
+                preview: preview
+            ))
+        }
+
+        if statement == recent {
+            sqlite3_reset(statement)
+        } else {
+            sqlite3_finalize(statement)
+        }
+
+        self.items = items
+    }
+
+    private static func writeThumbnail(_ source: CGImageSource, to folder: URL) {
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 240,
+        ] as CFDictionary
+
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return }
+
+        let destination = CGImageDestinationCreateWithURL(folder.appending(path: "thumbnail.png") as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, thumbnail, nil)
+        CGImageDestinationFinalize(destination)
+    }
+
+    private static func resetData() {
+        try! FileManager.default.removeItem(at: data)
+        try! FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+    }
+}
+
+struct Row: View {
+    let title: String
+    var detail = ""
+    var preview: URL?
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                if let preview {
+                    Image(nsImage: NSImage(byReferencing: preview))
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 240, maxHeight: 60, alignment: .leading)
+                }
+
+                Text(title).lineLimit(1)
+
+                Spacer()
+
+                Text(detail).foregroundStyle(selected ? .white : .secondary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .frame(minHeight: 22)
+            .foregroundStyle(selected ? .white : .primary)
+            .background(selected ? Color.accentColor : .clear, in: RoundedRectangle(cornerRadius: 4))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ContentView: View {
+    @Bindable var history: History
+    @State private var selection: Int64?
+    @State private var hovered: String?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+
+                TextField("Search", text: $history.query)
+                    .textFieldStyle(.plain)
+                    .focused($focused)
+            }
+            .padding(6)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(history.items) { item in
+                            Row(title: item.title, detail: item.detail, preview: item.preview, selected: item.id == selection) { history.copy(item) }
+                                .id(item.id)
+                                .onHover { if $0 { selection = item.id } }
+                        }
+                    }
+                }
+                .onChange(of: selection) { proxy.scrollTo(selection) }
+            }
+
+            Divider()
+
+            Row(title: "Clear…", detail: "⌥⌘⌫", selected: hovered == "clear") { history.clear() }
+                .keyboardShortcut(.delete, modifiers: [.option, .command])
+                .onHover { hovered = $0 ? "clear" : nil }
+
+            Row(title: "Quit", detail: "⌘Q", selected: hovered == "quit") { NSApp.terminate(nil) }
+                .keyboardShortcut("q")
+                .onHover { hovered = $0 ? "quit" : nil }
+        }
+        .padding(6)
+        .frame(width: 360, height: 420)
+        .onAppear {
+            history.query = ""
+            focused = true
+            selection = history.items.first?.id
+        }
+        .onChange(of: history.items.first?.id) { selection = history.items.first?.id }
+        .onKeyPress(.downArrow) { move(1) }
+        .onKeyPress(.upArrow) { move(-1) }
+        .onKeyPress(.return) {
+            if let item = history.items.first(where: { $0.id == selection }) { history.copy(item) }
+
+            return .handled
+        }
+    }
+
+    private func move(_ offset: Int) -> KeyPress.Result {
+        let index = history.items.firstIndex { $0.id == selection } ?? -1
+        let next = min(max(index + offset, 0), history.items.count - 1)
+
+        if next >= 0 { selection = history.items[next].id }
+
+        return .handled
+    }
+}
+
+@main
+struct PranchetaApp: App {
+    @State private var history = History()
+
+    init() {
+        try? SMAppService.mainApp.register()
+    }
+
+    var body: some Scene {
+        MenuBarExtra("Prancheta", systemImage: "list.clipboard") {
+            ContentView(history: history)
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
