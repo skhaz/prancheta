@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import ImageIO
 import ServiceManagement
 import SQLite3
@@ -7,6 +8,12 @@ import SwiftUI
 extension NSPasteboard.PasteboardType {
     static let concealed = Self("org.nspasteboard.ConcealedType")
     static let transient = Self("org.nspasteboard.TransientType")
+}
+
+extension SHA256.Digest {
+    var hex: String {
+        map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 struct Item: Identifiable {
@@ -18,7 +25,7 @@ struct Item: Identifiable {
     let kind: Kind
     let title: String
     let size: Int64
-    let storage: String
+    let folder: URL
     let preview: URL?
 
     var detail: String {
@@ -31,8 +38,10 @@ struct Item: Identifiable {
 final class History {
     static let directory = URL.applicationSupportDirectory.appending(path: "Prancheta")
     static let data = directory.appending(path: "data")
+    static let files = data.appending(path: "files")
+    static let images = data.appending(path: "images")
 
-    private static let schema: Int32 = 4
+    private static let schema: Int32 = 5
 
     var items: [Item] = []
 
@@ -44,7 +53,7 @@ final class History {
 
     private let database: OpaquePointer?
     private let insert: OpaquePointer?
-    private let remove: OpaquePointer?
+    private let known: OpaquePointer?
     private let trim: OpaquePointer?
     private let touch: OpaquePointer?
     private let recent: OpaquePointer?
@@ -75,7 +84,7 @@ final class History {
         }
 
         sqlite3_exec(database, """
-            CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, kind INTEGER NOT NULL, content TEXT NOT NULL, size INTEGER NOT NULL, storage TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, kind INTEGER NOT NULL, content TEXT NOT NULL, size INTEGER NOT NULL, hash TEXT NOT NULL, modified REAL NOT NULL, UNIQUE(kind, hash));
             CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(content, content='items', content_rowid='id', tokenize='trigram remove_diacritics 1');
             CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items WHEN new.kind != 2 BEGIN
               INSERT INTO items_fts(rowid, content) VALUES (new.id, new.content);
@@ -83,17 +92,20 @@ final class History {
             CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items WHEN old.kind != 2 BEGIN
               INSERT INTO items_fts(items_fts, rowid, content) VALUES ('delete', old.id, old.content);
             END;
-            CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF id ON items WHEN new.kind != 2 BEGIN
+            CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items WHEN new.kind != 2 BEGIN
               INSERT INTO items_fts(items_fts, rowid, content) VALUES ('delete', old.id, old.content);
               INSERT INTO items_fts(rowid, content) VALUES (new.id, new.content);
             END;
             """, nil, nil, nil)
 
-        insert = prepare("INSERT INTO items(kind, content, size, storage) VALUES (?, ?, ?, ?)")
-        remove = prepare("DELETE FROM items WHERE kind = ? AND content = ? RETURNING storage")
-        trim = prepare("DELETE FROM items WHERE id <= (SELECT id FROM items ORDER BY id DESC LIMIT 1 OFFSET 1000) RETURNING storage")
+        insert = prepare("""
+            INSERT INTO items(kind, content, size, hash, modified) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(kind, hash) DO UPDATE SET id = (SELECT max(id) FROM items) + 1, content = excluded.content, size = excluded.size, modified = excluded.modified
+            """)
+        known = prepare("SELECT hash FROM items WHERE kind = 1 AND content = ? AND size = ? AND modified = ?")
+        trim = prepare("DELETE FROM items WHERE id <= (SELECT id FROM items ORDER BY id DESC LIMIT 1 OFFSET 1000) RETURNING kind, hash")
         touch = prepare("UPDATE items SET id = (SELECT max(id) FROM items) + 1 WHERE id = ?")
-        recent = prepare("SELECT id, kind, iif(kind = 1, content, substr(content, 1, 200)), size, storage, '' FROM items ORDER BY id DESC LIMIT 100")
+        recent = prepare("SELECT id, kind, iif(kind = 1, content, substr(content, 1, 200)), size, hash, '' FROM items ORDER BY id DESC LIMIT 100")
         fetch = prepare("SELECT content FROM items WHERE id = ?")
 
         self.database = database
@@ -114,45 +126,81 @@ final class History {
                 guard pasteboard.availableType(from: [.concealed, .transient]) == nil else { return }
 
                 var jobs: [String] = []
-                var entries: [(kind: Item.Kind, content: String, storage: String)] = []
+                var entries: [(kind: Item.Kind, content: String, size: Int64, hash: String, modified: Double)] = []
 
                 if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
                     for url in urls.reversed() {
-                        let storage = UUID().uuidString
-                        let folder = History.data.appending(path: storage)
-                        try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                        let size = Int64(values?.fileSize ?? 0)
+                        let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
 
-                        jobs += ["file", url.path, folder.path]
-                        entries.append((.file, url.path, storage))
+                        sqlite3_bind_text(self.known, 1, url.path, -1, self.transient)
+                        sqlite3_bind_int64(self.known, 2, size)
+                        sqlite3_bind_double(self.known, 3, modified)
+                        let hash = sqlite3_step(self.known) == SQLITE_ROW ? String(cString: sqlite3_column_text(self.known, 0)) : ""
+                        sqlite3_reset(self.known)
 
-                        DispatchQueue.global(qos: .utility).async {
-                            clonefile(url.path, folder.appending(path: url.lastPathComponent).path, 0)
+                        if hash.isEmpty {
+                            jobs += ["file", url.path]
                         }
+
+                        entries.append((.file, url.path, size, hash, modified))
                     }
                 } else if let text = pasteboard.string(forType: .string), !text.isEmpty {
-                    self.add(.text, text, size: Int64(text.utf8.count), storage: "")
+                    entries.append((.text, text, Int64(text.utf8.count), SHA256.hash(data: Data(text.utf8)).hex, 0))
                 } else {
                     for (index, item) in pasteboard.pasteboardItems!.enumerated().reversed() {
                         guard let type = item.availableType(from: [.png, .tiff]) else { continue }
 
-                        let storage = UUID().uuidString
-                        try! FileManager.default.createDirectory(at: History.data.appending(path: storage), withIntermediateDirectories: true)
-
-                        jobs += ["image", String(index), History.data.appending(path: storage).path]
-                        entries.append((.image, type.rawValue, storage))
+                        jobs += ["image", String(index)]
+                        entries.append((.image, type.rawValue, 0, "", 0))
                     }
                 }
 
+                var hashes = [Substring]().makeIterator()
+
                 if !jobs.isEmpty {
-                    try! Process.run(Bundle.main.executableURL!, arguments: jobs).waitUntilExit()
+                    let pipe = Pipe()
+                    let process = Process()
+                    process.executableURL = Bundle.main.executableURL
+                    process.arguments = jobs
+                    process.standardOutput = pipe
+                    try! process.run()
+
+                    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    process.waitUntilExit()
+
+                    hashes = output.split(separator: "\n").makeIterator()
                 }
+
+                sqlite3_exec(self.database, "BEGIN", nil, nil, nil)
 
                 for entry in entries {
-                    let file = entry.kind == .image ? History.data.appending(path: entry.storage).appending(path: "image") : URL(filePath: entry.content)
-                    let size = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+                    let hash = entry.hash.isEmpty ? String(hashes.next()!) : entry.hash
+                    let image = History.images.appending(path: hash).appending(path: "image")
+                    let size = entry.kind == .image ? Int64((try? image.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) : entry.size
 
-                    self.add(entry.kind, entry.content, size: size, storage: entry.storage)
+                    sqlite3_bind_int(self.insert, 1, entry.kind.rawValue)
+                    sqlite3_bind_text(self.insert, 2, entry.content, -1, self.transient)
+                    sqlite3_bind_int64(self.insert, 3, size)
+                    sqlite3_bind_text(self.insert, 4, hash, -1, self.transient)
+                    sqlite3_bind_double(self.insert, 5, entry.modified)
+                    sqlite3_step(self.insert)
+                    sqlite3_reset(self.insert)
                 }
+
+                while sqlite3_step(self.trim) == SQLITE_ROW {
+                    let kind = Item.Kind(rawValue: sqlite3_column_int(self.trim, 0))!
+                    let hash = String(cString: sqlite3_column_text(self.trim, 1))
+
+                    if kind != .text {
+                        try? FileManager.default.removeItem(at: (kind == .file ? History.files : History.images).appending(path: hash))
+                    }
+                }
+
+                sqlite3_reset(self.trim)
+
+                sqlite3_exec(self.database, "COMMIT", nil, nil, nil)
 
                 self.reload()
             }
@@ -165,7 +213,6 @@ final class History {
         let content = String(cString: sqlite3_column_text(fetch, 0))
         sqlite3_reset(fetch)
 
-        let folder = History.data.appending(path: item.storage)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
 
@@ -173,13 +220,12 @@ final class History {
         case .text:
             pasteboard.setString(content, forType: .string)
         case .file:
-            let original = URL(filePath: content)
-            let clone = folder.appending(path: original.lastPathComponent)
+            let clone = try? FileManager.default.contentsOfDirectory(at: item.folder, includingPropertiesForKeys: nil).first { $0.lastPathComponent != "thumbnail.png" }
 
-            pasteboard.writeObjects([(FileManager.default.fileExists(atPath: clone.path) ? clone : original) as NSURL])
+            pasteboard.writeObjects([(clone ?? URL(filePath: content)) as NSURL])
         case .image:
             copying = true
-            try! Process.run(Bundle.main.executableURL!, arguments: ["copy", folder.appending(path: "image").path, content]).waitUntilExit()
+            try! Process.run(Bundle.main.executableURL!, arguments: ["copy", item.folder.appending(path: "image").path, content]).waitUntilExit()
             copying = false
         }
 
@@ -210,39 +256,6 @@ final class History {
         reload()
     }
 
-    private func add(_ kind: Item.Kind, _ content: String, size: Int64, storage: String) {
-        sqlite3_exec(database, "BEGIN", nil, nil, nil)
-
-        if kind != .image {
-            sqlite3_bind_int(remove, 1, kind.rawValue)
-            sqlite3_bind_text(remove, 2, content, -1, transient)
-            deleteStorage(remove)
-        }
-
-        sqlite3_bind_int(insert, 1, kind.rawValue)
-        sqlite3_bind_text(insert, 2, content, -1, transient)
-        sqlite3_bind_int64(insert, 3, size)
-        sqlite3_bind_text(insert, 4, storage, -1, transient)
-        sqlite3_step(insert)
-        sqlite3_reset(insert)
-
-        deleteStorage(trim)
-
-        sqlite3_exec(database, "COMMIT", nil, nil, nil)
-    }
-
-    private func deleteStorage(_ statement: OpaquePointer?) {
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let storage = String(cString: sqlite3_column_text(statement, 0))
-
-            if !storage.isEmpty {
-                try? FileManager.default.removeItem(at: History.data.appending(path: storage))
-            }
-        }
-
-        sqlite3_reset(statement)
-    }
-
     private func reload() {
         let terms = query.split(separator: " ")
         let long = terms.filter { $0.count >= 3 }
@@ -251,7 +264,7 @@ final class History {
         var statement = recent
 
         if !terms.isEmpty {
-            var sql = "SELECT items.id, items.kind, iif(items.kind = 1, items.content, substr(items.content, 1, 200)), items.size, items.storage, "
+            var sql = "SELECT items.id, items.kind, iif(items.kind = 1, items.content, substr(items.content, 1, 200)), items.size, items.hash, "
             sql += long.isEmpty ? "'' FROM items WHERE items.kind != 2" : "snippet(items_fts, 0, '', '', '…', 64) FROM items JOIN items_fts ON items_fts.rowid = items.id WHERE items.kind != 2 AND items_fts MATCH ?"
             sql += String(repeating: " AND items.content LIKE ? ESCAPE '\\'", count: short.count)
             sql += " ORDER BY items.id DESC LIMIT 100"
@@ -287,8 +300,8 @@ final class History {
             case .image: ""
             }
 
-            let storage = String(cString: sqlite3_column_text(statement, 4))
-            let thumbnail = History.data.appending(path: storage).appending(path: "thumbnail.png")
+            let folder = (kind == .file ? History.files : History.images).appending(path: String(cString: sqlite3_column_text(statement, 4)))
+            let thumbnail = folder.appending(path: "thumbnail.png")
             let preview = kind == .image || (kind == .file && FileManager.default.fileExists(atPath: thumbnail.path)) ? thumbnail : nil
 
             items.append(Item(
@@ -296,7 +309,7 @@ final class History {
                 kind: kind,
                 title: title,
                 size: sqlite3_column_int64(statement, 3),
-                storage: storage,
+                folder: folder,
                 preview: preview
             ))
         }
@@ -312,7 +325,8 @@ final class History {
 
     private static func resetData() {
         try! FileManager.default.removeItem(at: data)
-        try! FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
     }
 }
 
@@ -420,26 +434,52 @@ struct ContentView: View {
 
 @main
 enum Main {
+    @MainActor
     static func main() {
-        guard CommandLine.arguments.count > 1 else { return PranchetaApp.main() }
-
         let arguments = CommandLine.arguments
+        guard arguments.count > 1 else { return PranchetaApp.main() }
+
         let pasteboard = NSPasteboard.general
 
-        for job in stride(from: 1, to: arguments.count, by: 3) {
-            var source = URL(filePath: arguments[job + 1])
-            let target = URL(filePath: arguments[job + 2])
+        if arguments[1] == "copy" {
+            pasteboard.clearContents()
+            pasteboard.setData(try! Data(contentsOf: URL(filePath: arguments[2]), options: .alwaysMapped), forType: .init(arguments[3]))
+            return
+        }
 
-            if arguments[job] == "copy" {
-                pasteboard.clearContents()
-                pasteboard.setData(try! Data(contentsOf: source, options: .alwaysMapped), forType: .init(arguments[job + 2]))
-                continue
+        for job in stride(from: 1, to: arguments.count, by: 2) {
+            let image = arguments[job] == "image"
+            var source = URL(filePath: arguments[job + 1])
+            var data: Data?
+            var hasher = SHA256()
+
+            if image {
+                let item = pasteboard.pasteboardItems![Int(arguments[job + 1])!]
+                data = item.data(forType: item.availableType(from: [.png, .tiff])!)!
+                hasher.update(data: data!)
+            } else if (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                let handle = try! FileHandle(forReadingFrom: source)
+
+                while let chunk = try! handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+                    hasher.update(data: chunk)
+                }
+            } else {
+                hasher.update(data: Data(source.path.utf8))
             }
 
-            if arguments[job] == "image" {
-                let item = pasteboard.pasteboardItems![Int(arguments[job + 1])!]
-                source = target.appending(path: "image")
-                try! item.data(forType: item.availableType(from: [.png, .tiff])!)!.write(to: source)
+            let hash = hasher.finalize().hex
+            print(hash)
+
+            let folder = (image ? History.images : History.files).appending(path: hash)
+            guard !FileManager.default.fileExists(atPath: folder.path) else { continue }
+
+            try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+            if image {
+                source = folder.appending(path: "image")
+                try! data!.write(to: source)
+            } else {
+                clonefile(source.path, folder.appending(path: source.lastPathComponent).path, 0)
             }
 
             let options = [
@@ -448,9 +488,9 @@ enum Main {
                 kCGImageSourceThumbnailMaxPixelSize: 240,
             ] as CFDictionary
 
-            guard let image = CGImageSourceCreateWithURL(source as CFURL, nil), let thumbnail = CGImageSourceCreateThumbnailAtIndex(image, 0, options) else { continue }
+            guard let thumbnail = CGImageSourceCreateWithURL(source as CFURL, nil).flatMap({ CGImageSourceCreateThumbnailAtIndex($0, 0, options) }) else { continue }
 
-            let destination = CGImageDestinationCreateWithURL(target.appending(path: "thumbnail.png") as CFURL, "public.png" as CFString, 1, nil)!
+            let destination = CGImageDestinationCreateWithURL(folder.appending(path: "thumbnail.png") as CFURL, "public.png" as CFString, 1, nil)!
             CGImageDestinationAddImage(destination, thumbnail, nil)
             CGImageDestinationFinalize(destination)
         }
