@@ -40,6 +40,8 @@ final class History {
     static let data = directory.appending(path: "data")
     static let files = data.appending(path: "files")
     static let images = data.appending(path: "images")
+    static let texts = data.appending(path: "texts")
+    static let rich: [NSPasteboard.PasteboardType] = [.rtf, .html]
 
     private static let schema: Int32 = 5
 
@@ -62,7 +64,7 @@ final class History {
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     init() {
-        try! FileManager.default.createDirectory(at: History.data, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: History.texts, withIntermediateDirectories: true)
 
         var database: OpaquePointer?
         sqlite3_open(History.directory.appending(path: "history.sqlite").path, &database)
@@ -147,7 +149,27 @@ final class History {
                         entries.append((.file, url.path, size, hash, modified))
                     }
                 } else if let text = pasteboard.string(forType: .string), !text.isEmpty {
-                    entries.append((.text, text, Int64(text.utf8.count), SHA256.hash(data: Data(text.utf8)).hex, 0))
+                    let rich = History.rich.compactMap { type in pasteboard.data(forType: type).map { (type, $0) } }
+                    var hasher = SHA256()
+                    hasher.update(data: Data(text.utf8))
+
+                    for (type, data) in rich {
+                        hasher.update(data: Data(type.rawValue.utf8))
+                        hasher.update(data: data)
+                    }
+
+                    let hash = hasher.finalize().hex
+                    let folder = History.texts.appending(path: hash)
+
+                    if !rich.isEmpty, !FileManager.default.fileExists(atPath: folder.path) {
+                        try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+                        for (type, data) in rich {
+                            try! data.write(to: folder.appending(path: type.rawValue))
+                        }
+                    }
+
+                    entries.append((.text, text, Int64(text.utf8.count), hash, 0))
                 } else {
                     for (index, item) in pasteboard.pasteboardItems!.enumerated().reversed() {
                         guard let type = item.availableType(from: [.png, .tiff]) else { continue }
@@ -196,9 +218,7 @@ final class History {
                     let kind = Item.Kind(rawValue: sqlite3_column_int(self.trim, 0))!
                     let hash = String(cString: sqlite3_column_text(self.trim, 1))
 
-                    if kind != .text {
-                        try? FileManager.default.removeItem(at: (kind == .file ? History.files : History.images).appending(path: hash))
-                    }
+                    try? FileManager.default.removeItem(at: History.folder(kind).appending(path: hash))
                 }
 
                 sqlite3_reset(self.trim)
@@ -221,7 +241,16 @@ final class History {
 
         switch item.kind {
         case .text:
-            pasteboard.setString(content, forType: .string)
+            let entry = NSPasteboardItem()
+            entry.setString(content, forType: .string)
+
+            for type in History.rich {
+                if let data = try? Data(contentsOf: item.folder.appending(path: type.rawValue)) {
+                    entry.setData(data, forType: type)
+                }
+            }
+
+            pasteboard.writeObjects([entry])
         case .file:
             let clone = try? FileManager.default.contentsOfDirectory(at: item.folder, includingPropertiesForKeys: nil).first { $0.lastPathComponent != "thumbnail.png" }
 
@@ -303,7 +332,7 @@ final class History {
             case .image: ""
             }
 
-            let folder = (kind == .file ? History.files : History.images).appending(path: String(cString: sqlite3_column_text(statement, 4)))
+            let folder = History.folder(kind).appending(path: String(cString: sqlite3_column_text(statement, 4)))
             let thumbnail = folder.appending(path: "thumbnail.png")
             let preview = kind == .image || (kind == .file && FileManager.default.fileExists(atPath: thumbnail.path)) ? thumbnail : nil
 
@@ -326,10 +355,19 @@ final class History {
         self.items = items
     }
 
+    static func folder(_ kind: Item.Kind) -> URL {
+        switch kind {
+        case .text: texts
+        case .file: files
+        case .image: images
+        }
+    }
+
     private static func resetData() {
         try! FileManager.default.removeItem(at: data)
         try! FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
         try! FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: texts, withIntermediateDirectories: true)
     }
 }
 
@@ -480,7 +518,7 @@ enum Main {
             let hash = hasher.finalize().hex
             print(hash)
 
-            let folder = (image ? History.images : History.files).appending(path: hash)
+            let folder = History.folder(image ? .image : .file).appending(path: hash)
             guard !FileManager.default.fileExists(atPath: folder.path) else { continue }
 
             try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
