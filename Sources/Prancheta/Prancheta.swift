@@ -43,7 +43,7 @@ final class History {
     static let texts = data.appending(path: "texts")
     static let rich: [NSPasteboard.PasteboardType] = [.rtf, .html]
 
-    private static let schema: Int32 = 5
+    private static let schema: Int32 = 6
 
     var items: [Item] = []
 
